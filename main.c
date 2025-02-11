@@ -5,11 +5,11 @@
 #include <regex.h>
 #include <sqlite3.h>
 
-#define KEY_SIZE 16                                  // AES-128 key size, change to 24 or 32 for AES-192 or AES-256 respectively
-#define IV_SIZE 16                                   // AES block size is always 128 bits (16 bytes)
-#define DB_NAME "pm_cli.db"                          // DB name, change to your liking
-#define REGEX "^[a-zA-Z0-9!@#$%^&*()_\\-+=<>?]{8,}$" // Regex pattern for password validation, change to your liking
-#define RAND_PASS_LENGTH 16                          // Length of randomly generated password, change to your liking
+#define KEY_SIZE 16                                // AES-128 key size, change to 24 or 32 for AES-192 or AES-256 respectively
+#define IV_SIZE 16                                 // AES block size is always 128 bits (16 bytes)
+#define DB_NAME "pm_cli.db"                        // DB name, change to your liking
+#define REGEX "^[a-zA-Z0-9!@#$%^&*()_+=<>?-]{8,}$" // Regex pattern for password validation, change to your liking
+#define RAND_PASS_LENGTH 16                        // Length of randomly generated password, change to your liking
 
 // Function to get value from DB (master passcode, key, IV)
 int get_from_db(sqlite3 *db, const char *table, const char *column, char *result)
@@ -29,6 +29,10 @@ int get_from_db(sqlite3 *db, const char *table, const char *column, char *result
     if (rc == SQLITE_ROW)
     {
         strcpy(result, (char *)sqlite3_column_text(stmt, 0));
+    }
+    else if (rc == SQLITE_DONE)
+    {
+        result[0] = '\0'; // No rows returned, set result to empty string
     }
     else
     {
@@ -58,7 +62,7 @@ sqlite3 *create_db()
     // Create tables
     char *sql = "CREATE TABLE IF NOT EXISTS Accounts ("
                 "id INTEGER PRIMARY KEY AUTOINCREMENT, "
-                "account_name TEXT NOT NULL, "
+                "account_name TEXT NOT NULL UNIQUE, " // Add UNIQUE constraint here
                 "password BLOB NOT NULL, "
                 "ciphertext_len INTEGER NOT NULL);"
 
@@ -96,14 +100,50 @@ sqlite3 *create_db()
     }
     sqlite3_finalize(stmt);
 
-    // If no key, IV, or master password, reset DB and generate new ones
+    // If no key, IV, or master password, prompt user to set them
     if (count == 0)
     {
-        printf("No encryption key or master password found. Resetting database...\n");
+        printf("No encryption key or master password found. Setting up new database...\n");
 
-        // Delete all records in both tables
-        char *clear_sql = "DELETE FROM Accounts; DELETE FROM Key_IV;";
-        sqlite3_exec(db, clear_sql, 0, 0, &err_msg);
+        // Generate key and IV
+        unsigned char key[KEY_SIZE], iv[IV_SIZE];
+        if (RAND_bytes(key, KEY_SIZE) != 1 || RAND_bytes(iv, IV_SIZE) != 1)
+        {
+            fprintf(stderr, "OpenSSL RAND_bytes failed\n");
+            sqlite3_close(db);
+            return NULL;
+        }
+
+        // Prompt user for master password
+        char master_password[128];
+        printf("Enter a new master password: ");
+        scanf("%127s", master_password);
+
+        // Insert key, IV, and master password into Key_IV table
+        char *insert_sql = "INSERT INTO Key_IV (key, iv, master_password) VALUES (?, ?, ?);";
+        rc = sqlite3_prepare_v2(db, insert_sql, -1, &stmt, 0);
+        if (rc != SQLITE_OK)
+        {
+            fprintf(stderr, "Failed to prepare statement: %s\n", sqlite3_errmsg(db));
+            sqlite3_close(db);
+            return NULL;
+        }
+
+        sqlite3_bind_blob(stmt, 1, key, KEY_SIZE, SQLITE_STATIC);
+        sqlite3_bind_blob(stmt, 2, iv, IV_SIZE, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 3, master_password, -1, SQLITE_STATIC);
+
+        rc = sqlite3_step(stmt);
+        if (rc != SQLITE_DONE)
+        {
+            fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(db));
+            sqlite3_finalize(stmt);
+            sqlite3_close(db);
+            return NULL;
+        }
+
+        sqlite3_finalize(stmt);
+        printf("Master password and encryption key set up successfully.\n");
     }
 
     return db;
@@ -202,7 +242,9 @@ int validate_input(const char *input, const char *pattern)
     result = regcomp(&regex, pattern, REG_EXTENDED);
     if (result != 0)
     {
-        printf("Could not compile regex!\n");
+        char error_message[256];
+        regerror(result, &regex, error_message, sizeof(error_message));
+        printf("Could not compile regex: %s\n", error_message);
         return 1;
     }
 
@@ -313,6 +355,15 @@ int display_specific(sqlite3 *db, unsigned char *account_name, unsigned char *ke
 int add_account(unsigned char account_name[128], unsigned char password[128], sqlite3 *db)
 {
     unsigned char key[KEY_SIZE], iv[IV_SIZE], ciphertext[128];
+
+    // Check if account name already exists
+    char existing_account[128];
+    if (get_from_db(db, "Accounts", "account_name", existing_account) == 0 && strcmp((char *)account_name, existing_account) == 0)
+    {
+        printf("Account name already exists. Please enter a different name.\n");
+        return 1;
+    }
+
     get_from_db(db, "Key_IV", "key", key);
     get_from_db(db, "Key_IV", "iv", iv);
 
@@ -419,10 +470,10 @@ int nuke()
 // Function to securely randomly generate a password for the user
 char *generate_password()
 {
-    const char *special_characters = "!@#$%^&*()-_=+[]{}|;:,.<>?";
     const char *lowercase_letters = "abcdefghijklmnopqrstuvwxyz";
     const char *uppercase_letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
     const char *numbers = "0123456789";
+    const char *special_characters = "!@#$%^&*()_-+=<>?";
 
     char *password = malloc(RAND_PASS_LENGTH + 1);
     if (!password)
@@ -440,35 +491,24 @@ char *generate_password()
     }
 
     // Ensure at least one of each required character type
-    password[0] = special_characters[random_bytes[0] % strlen(special_characters)];
-    password[1] = lowercase_letters[random_bytes[1] % strlen(lowercase_letters)];
-    password[2] = uppercase_letters[random_bytes[2] % strlen(uppercase_letters)];
-    password[3] = numbers[random_bytes[3] % strlen(numbers)];
+    password[0] = lowercase_letters[random_bytes[0] % strlen(lowercase_letters)];
+    password[1] = uppercase_letters[random_bytes[1] % strlen(uppercase_letters)];
+    password[2] = numbers[random_bytes[2] % strlen(numbers)];
+    password[3] = special_characters[random_bytes[3] % strlen(special_characters)];
 
-    // Fill the rest with random characters
+    // Fill the rest with random characters from all sets
+    const char *all_characters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()_-+=<>?";
     for (size_t i = 4; i < RAND_PASS_LENGTH; i++)
     {
-        const char *charset;
-        switch (random_bytes[i] % 4)
-        {
-        case 0:
-            charset = special_characters;
-            break;
-        case 1:
-            charset = lowercase_letters;
-            break;
-        case 2:
-            charset = uppercase_letters;
-            break;
-        default:
-            charset = numbers;
-            break;
-        }
-        password[i] = charset[random_bytes[i] % strlen(charset)];
+        password[i] = all_characters[random_bytes[i] % strlen(all_characters)];
     }
+
+    password[RAND_PASS_LENGTH] = '\0'; // Null-terminate the password
+
     return password;
 }
 
+// Main function
 int main()
 {
     // define variables
@@ -481,27 +521,31 @@ int main()
 
     // Create DB and get master password
     sqlite3 *db = create_db();
-    get_from_db(db, "Key_IV", "master_password", master);
-    get_from_db(db, "Key_IV", "key", key);
-    get_from_db(db, "Key_IV", "iv", iv);
 
+    if (db != NULL)
+    {
+        get_from_db(db, "Key_IV", "master_password", master);
+        get_from_db(db, "Key_IV", "key", key);
+        get_from_db(db, "Key_IV", "iv", iv);
+    }
+    
     // Get master password from user
     printf("Enter master password to access. Enter q to quit.\n");
     do
     {
-        scanf("%s", master_input);
+        scanf("%15s", master_input);
         if (strcmp(master_input, "q") == 0)
         {
             printf("Exiting...\n");
             exit(0);
         }
 
-        if (strcmp(master_input, master) != 0)
+        if (strcmp(master_input, (char *)master) != 0)
         {
             printf("Incorrect. Try again. Enter q to quit.\n");
         }
 
-    } while (strcmp(master, master_input) != 0);
+    } while (strcmp(master_input, (char *)master) != 0);
 
     // Main menu
     printf("Welcome to the PM_CLI by kinan.\n");
@@ -511,32 +555,43 @@ int main()
         printf("\n1. Add new account\n2. Manage existing accounts\n3. Nuke\n4. Quit\n");
         printf("Enter choice:\n");
         scanf("%d", &user_input);
+        getchar(); // Consume the newline character left by scanf
 
         switch (user_input)
         {
         case 1:
+        {
             unsigned char account_name[128], password[128];
+            char existing_account[128];
 
-            printf("Enter account name:\n");
             do
             {
-                fgets(account_name, sizeof(account_name), stdin);
+                printf("Enter account name (cannot be 'q'):\n");
+                fgets((char *)account_name, sizeof(account_name), stdin);
+                account_name[strcspn((char *)account_name, "\n")] = '\0'; // Remove newline character
 
-                // Remove newline character from fgets input if it exists
-                account_name[strcspn((char *)account_name, "\n")] = '\0';
-
-            } while (account_name[0] == '\0');
+                if (strcmp((char *)account_name, "q") == 0)
+                {
+                    printf("Account name cannot be 'q'. Please enter a different name.\n");
+                }
+                else if (get_from_db(db, "Accounts", "account_name", existing_account) == 0 && strcmp((char *)account_name, existing_account) == 0)
+                {
+                    printf("Account name already exists. Please enter a different name.\n");
+                }
+                else
+                {
+                    break;
+                }
+            } while (1);
 
             printf("Enter password (enter 'g' to randomly generate a password):\n");
 
-            while (1)
+            do
             {
-                fgets(password, sizeof(password), stdin);
+                fgets((char *)password, sizeof(password), stdin);
+                password[strcspn((char *)password, "\n")] = '\0'; // Remove newline character
 
-                // Remove newline character from fgets input if it exists
-                password[strcspn((char *)password, "\n")] = '\0';
-
-                if (strcmp(password, "g") == 0)
+                if (strcmp((char *)password, "g") == 0)
                 {
                     char *generated_password = generate_password();
                     if (generated_password != NULL)
@@ -544,70 +599,59 @@ int main()
                         strncpy((char *)password, generated_password, sizeof(password) - 1);
                         password[sizeof(password) - 1] = '\0'; // Ensure null-termination
                         free(generated_password);
+                        break;
                     }
                 }
-
-                // Validate input (whether user-entered or generated)
-                if (validate_input(password, pattern) == 0) // Check if the password is valid
-                    break;
-
-                printf("Invalid password, please try again:\n");
-                printf("%s", password);
-            }
+            } while (validate_input((char *)password, pattern) != 0);
 
             add_account(account_name, password, db);
             break;
+        }
         case 2:
+        {
+            int manage_choice;
             printf("Account management: would you like to\n1. Display all accounts\n2. Display specific account\n3. Delete account\n4. Go back\n");
-            scanf("%d", &user_input);
-            switch (user_input)
+            scanf("%d", &manage_choice);
+            getchar(); // Consume the newline character left by scanf
+
+            switch (manage_choice)
             {
             case 1:
                 display_accounts(db, key, iv);
                 break;
             case 2:
+            {
+                unsigned char account_name[128];
                 printf("Enter account name to lookup, or enter q to go back:\n");
-                do
+                fgets((char *)account_name, sizeof(account_name), stdin);
+                account_name[strcspn((char *)account_name, "\n")] = '\0'; // Remove newline character
+
+                if (strcmp((char *)account_name, "q") != 0)
                 {
-                    fgets(account_name, sizeof(account_name), stdin);
-
-                    // Remove newline character from fgets input if it exists
-                    account_name[strcspn((char *)account_name, "\n")] = '\0';
-
-                    if (strcmp(account_name, "q") == 0)
-                    {
-                        break;
-                    }
-
-                } while (account_name[0] == '\0');
-                display_specific(db, account_name, key, iv);
+                    display_specific(db, account_name, key, iv);
+                }
                 break;
+            }
             case 3:
+            {
+                unsigned char account_name[128];
                 printf("Enter account name to delete, or enter q to go back:\n");
-                do
+                fgets((char *)account_name, sizeof(account_name), stdin);
+                account_name[strcspn((char *)account_name, "\n")] = '\0'; // Remove newline character
+
+                if (strcmp((char *)account_name, "q") != 0)
                 {
-                    fgets(account_name, sizeof(account_name), stdin);
-
-                    // Remove newline character from fgets input if it exists
-                    account_name[strcspn((char *)account_name, "\n")] = '\0';
-
-                    if (strcmp(account_name, "q") == 0)
-                    {
-                        break;
-                    }
-
-                } while (account_name[0] == '\0');
-                delete_account(account_name, master, db);
+                    delete_account(account_name, master, db);
+                }
                 break;
+            }
             case 4:
-                nuke();
                 break;
             default:
                 printf("Invalid input. Please enter a choice from 1-4.\n");
             }
-
-            display_accounts(db, key, iv);
             break;
+        }
         case 3:
             nuke();
             break;
@@ -620,30 +664,4 @@ int main()
 
     sqlite3_close(db);
     return 0;
-
-    /*
-    unsigned char decryptedtext[128]; // Buffer for decrypted data
-
-    // Decrypt the ciphertext
-    int decryptedtext_len = aes_decrypt(ciphertext, ciphertext_len, key, iv, decryptedtext);
-    if (decryptedtext_len == -1)
-    {
-        return 1;
-    }
-
-    // Null-terminate the decrypted text (make it a valid C string)
-    decryptedtext[decryptedtext_len] = '\0';
-
-    // Print the decrypted data
-    printf("Decrypted text is: %s\n", decryptedtext);
-    */
 }
-
-/*
-    // Print the encrypted data in hexadecimal format
-    printf("Encrypted text is:\n");
-    for (int i = 0; i < ciphertext_len; i++)
-    {
-        printf("%02x ", ciphertext[i]); // Print each byte in hex format
-    }
-    */
